@@ -2011,6 +2011,7 @@ function spawnConfetti(color1, color2) {
 
 function showVictory(team) {
   SFX.victory();
+  try { playVictoryMusic(); } catch(e) {}
   if (suddenDeath) {
     // skip victory screen entirely — just restore and show winner on grid
     document.getElementById('detail-view').classList.remove('active');
@@ -2065,7 +2066,7 @@ function dismissSuddenDeath(winningTeam) {
   setTheme(preSuddenDeathTheme);
   updateBar();
   shuffle();
-  try{ playGameMusic(); }catch(e){}
+  try{ playVictoryMusic(); }catch(e){}
 
   // show the same victory screen as a normal win
   const bg = document.getElementById('victory-bg');
@@ -2129,213 +2130,295 @@ document.getElementById('range-to').addEventListener('change', shuffle);
 
 window.addEventListener('resize', updateBar);
 
-// ══════════════════════════════════════
-// SFX ENGINE — Web Audio API, no files
-// ══════════════════════════════════════
-let _actx = null;
-function actx() {
-  if (!_actx) _actx = new (window.AudioContext || window.webkitAudioContext)();
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIO — one AudioContext, one master bus (compressor/limiter), separate
+// music and SFX buses so neither can blow out the speakers.
+// ══════════════════════════════════════════════════════════════════════════════
+let _actx=null, _master=null, _musicBus=null, _sfxBus=null, _muted=false;
+const MUSIC_VOL=0.55, SFX_VOL=0.5;
+function actx(){
+  if(!_actx){
+    _actx=new (window.AudioContext||window.webkitAudioContext)();
+    const comp=_actx.createDynamicsCompressor();
+    comp.threshold.value=-12; comp.knee.value=6; comp.ratio.value=4;
+    comp.attack.value=0.003; comp.release.value=0.2;
+    _master=_actx.createGain(); _master.gain.value=0.9;
+    _master.connect(comp); comp.connect(_actx.destination);
+    _musicBus=_actx.createGain(); _musicBus.gain.value=_muted?0:MUSIC_VOL; _musicBus.connect(_master);
+    _sfxBus=_actx.createGain(); _sfxBus.gain.value=SFX_VOL; _sfxBus.connect(_master);
+  }
+  if(_actx.state==='suspended') _actx.resume();
   return _actx;
 }
+function sfxOut(){ actx(); return _sfxBus; }
+function musicOut(){ actx(); return _musicBus; }
 
-const SFX = {
+// ── Notes ─────────────────────────────────────────────────────────────────────
+const _PC={C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11};
+function _midi(n){const m=/^([A-G][#b]?)(-?\d)$/.exec(n);if(!m)throw new Error('bad note '+n);return 12*(+m[2]+1)+_PC[m[1]];}
+function _hz(n){const m=typeof n==='number'?n:_midi(n);return 440*Math.pow(2,(m-69)/12);}
+const _CHORDS={D:['D','F#','A'],Bm:['B','D','F#'],G:['G','B','D'],A:['A','C#','E'],Em:['E','G','B'],
+  Dm:['D','F','A'],Eb:['Eb','G','Bb'],Gm:['G','Bb','D'],Bb:['Bb','D','F'],A7:['A','C#','E','G']};
+function _voicing(ch,oct){let prev=-1;return _CHORDS[ch].map(pc=>{let m=12*(oct+1)+_PC[pc];while(m<=prev)m+=12;prev=m;return m;});}
+function _root(ch,oct){return 12*(oct+1)+_PC[_CHORDS[ch][0]];}
+function _tone(ch,oct,i){const v=_voicing(ch,oct);return v[i%v.length]+12*Math.floor(i/v.length);}
+// Melody bars: 16 tokens per bar. Note = start, "." = hold, "-" = rest.
+function _parseBar(str){
+  const tok=str.trim().split(/\s+/);
+  if(tok.length!==16){console.error('bar needs 16 steps:',str);while(tok.length<16)tok.push('-');tok.length=16;}
+  const ev=[];let cur=null;
+  tok.forEach((t,i)=>{if(t==='.'){if(cur)cur.d++;return;}if(t==='-'){cur=null;return;}cur={s:i,n:_midi(t),d:1};ev.push(cur);});
+  return ev;
+}
+function _parseMel(bars){return bars.map(_parseBar);}
+function _rnd(i){const x=Math.sin(i*127.1+311.7)*43758.5453;return x-Math.floor(x);}
 
-  // Flyswatter thwack — word card clicked
-  swat() {
-    const ctx = actx();
-    const t = ctx.currentTime;
+// ── Synth (ported from the Dungeon sound lab) ────────────────────────────────
+class Synth{
+  constructor(ctx,out){
+    this.ctx=ctx;this.out=out;this.pw={};this.pans={};
+    const len=ctx.sampleRate,buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);
+    for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+    this.noiseBuf=buf;
+    this.dist=ctx.createWaveShaper();const k=25,n=1024,c=new Float32Array(n);
+    for(let i=0;i<n;i++){const x=i*2/n-1;c[i]=(1+k)*x/(1+k*Math.abs(x));}
+    this.dist.curve=c;const dlp=ctx.createBiquadFilter();dlp.type='lowpass';dlp.frequency.value=1300;
+    const dg=ctx.createGain();dg.gain.value=0.12;this.dist.connect(dlp);dlp.connect(dg);dg.connect(out);
+  }
+  pan(v){if(this.pans[v])return this.pans[v];if(!this.ctx.createStereoPanner)return this.out;const p=this.ctx.createStereoPanner();p.pan.value=v;p.connect(this.out);return this.pans[v]=p;}
+  wave(duty){
+    if(!this.pw[duty]&&this.ctx.createPeriodicWave){const n=40,re=new Float32Array(n),im=new Float32Array(n);
+      for(let k=1;k<n;k++)re[k]=(2/(k*Math.PI))*Math.sin(Math.PI*k*duty);
+      this.pw[duty]=this.ctx.createPeriodicWave(re,im);}
+    return this.pw[duty];
+  }
+  voice(o){
+    const c=this.ctx,t=o.t,end=t+o.dur,rel=o.rel??0.05;
+    const osc=c.createOscillator();
+    const pw=o.duty?this.wave(o.duty):null;
+    if(pw)osc.setPeriodicWave(pw);else osc.type=o.type||'square';
+    osc.frequency.setValueAtTime(o.f,t);
+    if(o.slideTo)osc.frequency.exponentialRampToValueAtTime(o.slideTo,t+(o.slideDur||o.dur));
+    if(o.detune)osc.detune.value=o.detune;
+    if(o.vib){const l=c.createOscillator(),lg=c.createGain();l.frequency.value=5.2;lg.gain.value=o.f*0.007;l.connect(lg);lg.connect(osc.frequency);l.start(t+0.15);l.stop(end+rel+0.1);}
+    const g=c.createGain(),a=o.a??0.005;
+    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(o.vol,t+a);
+    if(o.sus!=null){g.gain.setTargetAtTime(o.vol*o.sus,t+a,o.decay||0.12);g.gain.setTargetAtTime(0,end,rel);}
+    else g.gain.exponentialRampToValueAtTime(0.0001,end);
+    let node=osc;
+    if(o.lp){const f=c.createBiquadFilter();f.type='lowpass';f.frequency.setValueAtTime(o.lp,t);if(o.lpTo)f.frequency.exponentialRampToValueAtTime(o.lpTo,end);f.Q.value=o.q||0.7;osc.connect(f);node=f;}
+    node.connect(g);g.connect(o.dest||this.out);
+    osc.start(t);osc.stop(end+rel*6+0.05);
+  }
+  noise(o){
+    const c=this.ctx,src=c.createBufferSource();src.buffer=this.noiseBuf;
+    const f=c.createBiquadFilter();f.type=o.ft||'highpass';f.frequency.value=o.ff||6000;if(o.q)f.Q.value=o.q;
+    const g=c.createGain(),a=o.a??0.001;
+    g.gain.setValueAtTime(0,o.t);g.gain.linearRampToValueAtTime(o.vol,o.t+a);g.gain.exponentialRampToValueAtTime(0.0001,o.t+o.dur);
+    src.connect(f);f.connect(g);g.connect(o.dest||this.out);src.start(o.t,Math.random()*0.5);src.stop(o.t+o.dur+0.05);
+  }
+  // instruments
+  lead(m,t,d,v,o={}){this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v,duty:0.25,sus:0.75,decay:0.2,rel:0.06,vib:d>0.3,lp:4200},o));}
+  // bamboo flute: soft triangle + pulse, vibrato, a puff of breath on the attack
+  flute(m,t,d,v,o={}){
+    this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v,type:'triangle',a:0.03,sus:0.85,decay:0.2,rel:0.08,vib:d>0.25},o));
+    this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v*0.25,duty:0.5,a:0.04,sus:0.8,rel:0.08,lp:1800,vib:d>0.25},o));
+    this.noise({t,dur:0.08,vol:v*0.5,ft:'bandpass',ff:_hz(m)*2,q:2,dest:o.dest});
+  }
+  // koto / shamisen pluck: thin pulse with a fast filter drop
+  koto(m,t,d,v,o={}){
+    this.voice(Object.assign({f:_hz(m),t,dur:Math.max(d,0.25),vol:v,duty:0.125,lp:4500,lpTo:600},o));
+    this.voice(Object.assign({f:_hz(m)*2,t,dur:0.12,vol:v*0.3,type:'triangle'},o));
+  }
+  brass(m,t,d,v,o={}){this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v,type:'sawtooth',a:0.03,sus:0.8,decay:0.15,rel:0.08,lp:1400,lpTo:3200},o));this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v*0.6,duty:0.5,a:0.02,sus:0.8,rel:0.08,lp:2500},o));}
+  bass(m,t,d,v,o={}){this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v,type:'triangle',sus:0.85,rel:0.05},o));this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v*0.35,duty:0.5,sus:0.8,rel:0.05,lp:500},o));}
+  distBass(m,t,d,v){this.voice({f:_hz(m),t,dur:d,vol:v,type:'sawtooth',sus:0.9,rel:0.03,dest:this.dist});this.voice({f:_hz(m-12),t,dur:d,vol:v*0.45,type:'square',sus:0.9,rel:0.03,lp:300});}
+  bell(m,t,d,v,o={}){const f=_hz(m);this.voice(Object.assign({f,t,dur:d,vol:v,type:'sine',a:0.002},o));this.voice(Object.assign({f:f*2.76,t,dur:d*0.4,vol:v*0.35,type:'sine',a:0.002},o));}
+  pad(ms,t,d,v,o={}){ms.forEach(m=>{[-8,8].forEach(dt=>this.voice(Object.assign({f:_hz(m),t,dur:d,vol:v/ms.length/2,type:'sawtooth',detune:dt,a:0.35,sus:0.9,decay:0.3,rel:0.5,lp:o.lp||900},o)));});}
+  kick(t,v){this.voice({f:150,t,dur:0.26,vol:v,type:'sine',slideTo:45,slideDur:0.11,a:0.001});}
+  // taiko: deep, round, a little skin noise
+  taiko(t,v,f=95){this.voice({f,t,dur:0.45,vol:v,type:'sine',slideTo:f*0.55,slideDur:0.3,a:0.002});this.noise({t,dur:0.09,vol:v*0.35,ft:'lowpass',ff:700});}
+  snare(t,v){this.noise({t,dur:0.14,vol:v,ft:'bandpass',ff:1900,q:0.8});this.voice({f:200,t,dur:0.07,vol:v*0.5,type:'triangle',slideTo:140,a:0.001});}
+  hat(t,v,open){this.noise({t,dur:open?0.2:0.04,vol:v,ft:'highpass',ff:7500});}
+  // bamboo clack / woodblock
+  clack(t,v,f=1150){this.voice({f,t,dur:0.06,vol:v,type:'sine',slideTo:f*0.85,slideDur:0.05,a:0.001});this.noise({t,dur:0.025,vol:v*0.6,ft:'bandpass',ff:f*2,q:4});}
+  crash(t,v){this.noise({t,dur:1.4,vol:v,ft:'highpass',ff:4500});}
+  swell(t,d,v){const c=this.ctx,src=c.createBufferSource();src.buffer=this.noiseBuf;src.loop=true;const f=c.createBiquadFilter();f.type='highpass';f.frequency.setValueAtTime(2500,t);f.frequency.exponentialRampToValueAtTime(9000,t+d);const g=c.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(v,t+d);g.gain.linearRampToValueAtTime(0,t+d+0.05);src.connect(f);f.connect(g);g.connect(this.out);src.start(t);src.stop(t+d+0.1);}
+}
+function _melAt(E,bars,bar,s,t,fn,shift=0){const b=bars[bar%bars.length];for(const e of b)if(e.s===s)fn(e.n+shift,t,e.d*E.stepSec*0.95);}
 
-    // ── Layer 1: sharp crack (high-freq noise burst) ──
-    const crackBuf = ctx.createBuffer(1, ctx.sampleRate * 0.08, ctx.sampleRate);
-    const crackD = crackBuf.getChannelData(0);
-    for (let i = 0; i < crackD.length; i++)
-      crackD[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / crackD.length, 1.5);
-    const crack = ctx.createBufferSource();
-    crack.buffer = crackBuf;
-    const crackHp = ctx.createBiquadFilter();
-    crackHp.type = 'highpass'; crackHp.frequency.value = 3000;
-    const crackG = ctx.createGain();
-    crackG.gain.setValueAtTime(2.8, t);
-    crackG.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
-    crack.connect(crackHp); crackHp.connect(crackG); crackG.connect(ctx.destination);
-    crack.start(t);
-
-    // ── Layer 2: meaty slap body (mid noise) ──
-    const slapBuf = ctx.createBuffer(1, ctx.sampleRate * 0.18, ctx.sampleRate);
-    const slapD = slapBuf.getChannelData(0);
-    for (let i = 0; i < slapD.length; i++)
-      slapD[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / slapD.length, 2.2);
-    const slap = ctx.createBufferSource();
-    slap.buffer = slapBuf;
-    const slapBp = ctx.createBiquadFilter();
-    slapBp.type = 'bandpass'; slapBp.frequency.value = 800; slapBp.Q.value = 0.6;
-    const slapG = ctx.createGain();
-    slapG.gain.setValueAtTime(3.5, t);
-    slapG.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-    slap.connect(slapBp); slapBp.connect(slapG); slapG.connect(ctx.destination);
-    slap.start(t);
-
-    // ── Layer 3: deep thud (pitched punch) ──
-    const thud = ctx.createOscillator();
-    thud.type = 'sine';
-    thud.frequency.setValueAtTime(180, t);
-    thud.frequency.exponentialRampToValueAtTime(45, t + 0.12);
-    const thudG = ctx.createGain();
-    thudG.gain.setValueAtTime(1.8, t);
-    thudG.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
-    thud.connect(thudG); thudG.connect(ctx.destination);
-    thud.start(t); thud.stop(t + 0.14);
-
-    // ── Layer 4: wire twang (the swatter wire vibrating) ──
-    const twang = ctx.createOscillator();
-    twang.type = 'sawtooth';
-    twang.frequency.setValueAtTime(420, t + 0.01);
-    twang.frequency.exponentialRampToValueAtTime(180, t + 0.15);
-    const twangG = ctx.createGain();
-    twangG.gain.setValueAtTime(0, t);
-    twangG.gain.linearRampToValueAtTime(0.4, t + 0.01);
-    twangG.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-    const twangHp = ctx.createBiquadFilter();
-    twangHp.type = 'highpass'; twangHp.frequency.value = 300;
-    twang.connect(twangHp); twangHp.connect(twangG); twangG.connect(ctx.destination);
-    twang.start(t); twang.stop(t + 0.18);
-  },
-
-  // Shuffle whoosh — cards flying
-  shuffle() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    for (let i = 0; i < 5; i++) {
-      const delay = i * 0.045;
-      const buf = ctx.createBuffer(1, ctx.sampleRate * 0.14, ctx.sampleRate);
-      const d = buf.getChannelData(0);
-      for (let j = 0; j < d.length; j++) d[j] = (Math.random() * 2 - 1) * Math.pow(1 - j / d.length, 1.8);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      const hp = ctx.createBiquadFilter();
-      hp.type = 'highpass'; hp.frequency.value = 2000 + i * 400;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0.35, t + delay);
-      g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.14);
-      src.connect(hp); hp.connect(g); g.connect(ctx.destination);
-      src.start(t + delay);
+// ══════════════════════════════════════════════════════════════════════════════
+//  THE BAMBOO THEME + TRACKS
+//  All three share one melody idea (the "swat" motif: a quick run up to a held
+//  note, then a bounce back down) so the game sounds like one soundtrack.
+// ══════════════════════════════════════════════════════════════════════════════
+const BAMBOO_TRACKS={
+// ── Main game: "Bamboo Grove Dash" — D major pentatonic, 128 BPM ─────────────
+// Builds by itself over the first loops: 0 koto + bass + clacks,
+// 1 bamboo flute melody, 2 taiko + hats, 3+ bells and the octave flute.
+game:{
+  bpm:128,
+  bars:['D','D','Bm','Bm','G','G','A','A'],
+  mel:_parseMel([
+    'D5 . . E5 F#5 . A5 . B5 . A5 . F#5 . E5 .',
+    'D5 . . . . . - - A4 . B4 . D5 . E5 .',
+    'F#5 . . E5 D5 . B4 . D5 . E5 . F#5 . . .',
+    'E5 . . . D5 . B4 . A4 . . . - - - -',
+    'B4 . D5 . E5 . G5 . A5 . . . G5 . E5 .',
+    'D5 . E5 . B4 . . . - - D5 . E5 . G5 .',
+    'A5 . . . B5 . A5 . F#5 . E5 . D5 . E5 .',
+    'E5 . . . . . . . - - - - A4 . C#5 .']),
+  tick(E,step,t){
+    const bar=Math.floor(step/16),s=step%16,ch=this.bars[bar%8],S=E.stepSec;
+    const lvl=Math.min(3,Math.floor(step/128)); // one level per 8-bar loop
+    // bass: root on 1, fifth on the "and" of 2, octave pickup
+    if(s===0)E.bass(_root(ch,2),t,5*S,0.16);
+    if(s===6)E.bass(_root(ch,2)+7,t,2*S,0.11);
+    if(s===10)E.bass(_root(ch,2)+12,t,2*S,0.1);
+    if(s===12)E.bass(_root(ch,2)+7,t,3*S,0.11);
+    // koto arpeggio (always on)
+    if(s%2===0){const pat=[0,1,2,3,2,1,2,4];E.koto(_tone(ch,4,pat[s/2]),t,1.5*S,0.045,{dest:E.pan(-0.25)});}
+    // bamboo clacks — the signature groove
+    if(s===0||s===3||s===8||s===11)E.clack(t,s%8===0?0.07:0.045);
+    if(s===14)E.clack(t,0.04,1500);
+    if(s===0||s===8)E.kick(t,0.22);
+    if(s===4||s===12)E.snare(t,0.045);
+    // melody
+    if(lvl>=1)_melAt(E,this.mel,bar,s,t,(m,tt,d)=>E.flute(m,tt,Math.max(d,0.14),0.06,{dest:E.pan(0.15)}));
+    if(lvl>=2){
+      if(s%2===0)E.hat(t,s%4===2?0.025:0.015);
+      if(s===0&&bar%2===0)E.taiko(t,0.2);
+      if(s===10)E.taiko(t,0.12,120);
+      if(bar%8===7&&s>=12)E.taiko(t,0.14,[140,125,110,95][s-12]);
     }
-  },
+    if(lvl>=3){
+      _melAt(E,this.mel,bar,s,t,(m,tt,d)=>E.lead(m+12,tt,d,0.018,{duty:0.125,dest:E.pan(-0.4)}));
+      if(s===0)E.bell(_tone(ch,6,0),t,0.6,0.02);
+      if(bar%8===0&&s===0)E.crash(t,0.035);
+    }
+  }
+},
+// ── Sudden Death: "Swatter Showdown" — D in-scale (Japanese minor), 156 BPM ──
+// Heavy taiko, distorted bass riff, flute + lead trading the theme L/R.
+sd:{
+  bpm:156,
+  bars:['Dm','Dm','Eb','A'],
+  riff:[0,null,0,12,null,0,3,null,0,null,0,12,null,7,5,3],
+  mel:_parseMel([
+    'D5 . Eb5 . D5 . A4 . Bb4 . A4 . G4 . A4 .',
+    'D5 . Eb5 . G5 . Eb5 . D5 . . . - - A4 .',
+    'Eb5 . G5 . Bb5 . G5 . Eb5 . D5 . C5 . D5 .',
+    'A4 . . . C#5 . . . E5 . . . A5 . G5 .']),
+  tick(E,step,t){
+    const bar=Math.floor(step/16),s=step%16,ch=this.bars[bar%4],S=E.stepSec;
+    const lvl=Math.min(2,Math.floor(step/64));
+    const off=this.riff[s];
+    if(off!==null)E.distBass(_root(ch,2)+off,t,0.8*S,0.15);
+    // taiko pattern: big hits + rolling 16ths building into each bar
+    if(s===0||s===6||s===8)E.taiko(t,0.3,s===6?110:90);
+    if(s===4||s===12)E.snare(t,0.1);
+    if(s===14||s===15)E.taiko(t,0.14,130);
+    if(s%2===0)E.hat(t,0.025);else if(lvl>=1)E.hat(t,0.012);
+    if(s===3||s===11)E.clack(t,0.05,1300);
+    if(s===0)E.pad(_voicing(ch,3),t,16*S,0.05,{lp:700});
+    if(bar%4===0&&s===0)E.crash(t,0.045);
+    if(bar%4===3&&s===8)E.swell(t,8*S,0.05);
+    // theme: flute on the left, pulse lead echoes on the right
+    _melAt(E,this.mel,bar,s,t,(m,tt,d)=>E.flute(m,tt,Math.max(d,0.12),0.065,{dest:E.pan(-0.45)}));
+    if(lvl>=1)_melAt(E,this.mel,bar,s,t,(m,tt,d)=>E.lead(m-12,tt,d,0.03,{duty:0.5,lp:1800,dest:E.pan(0.45)}));
+    if(lvl>=2&&(s===2||s===10))E.kick(t,0.18);
+  }
+},
+// ── Victory: "Champion of the Grove" — D major fanfare, 126 BPM ─────────────
+victory:{
+  bpm:126,
+  bars:['D','G','Bm','A'],
+  mel:_parseMel([
+    'D5 . D5 E5 F#5 . A5 . . . . . F#5 . A5 .',
+    'B5 . . . A5 . G5 . A5 . . . . . - -',
+    'F#5 . F#5 E5 D5 . F#5 . B5 . . . A5 . F#5 .',
+    'E5 . . . F#5 . E5 . D5 . . . - - - -']),
+  tick(E,step,t){
+    const bar=Math.floor(step/16),s=step%16,ch=this.bars[bar%4],S=E.stepSec;
+    if(s%4===0)E.bass(_root(ch,2)+(s===8?7:0),t,1.6*S,0.13);
+    if(s===0||s===8)E.taiko(t,0.25);
+    if([4,12,13,14].includes(s))E.snare(t,s===4||s===12?0.08:0.045);
+    if(s%2===0)E.hat(t,0.018);
+    if(s===0&&bar%4===0)E.crash(t,0.05);
+    if(s===0||s===8)E.pad(_voicing(ch,4),t,(s===0?7:6)*S,0.05,{lp:1500});
+    _melAt(E,this.mel,bar,s,t,(m,tt,d)=>E.brass(m,tt,d,0.05));
+    if(s%2===1)E.bell(_tone(ch,6,(s-1)/2),t,0.3,0.012);
+  }
+}
+};
 
-  // Point scored — satisfying ink-splat pop
-  point() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(520, t);
-    osc.frequency.exponentialRampToValueAtTime(820, t + 0.04);
-    osc.frequency.exponentialRampToValueAtTime(480, t + 0.12);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.45, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
-    osc.connect(g); g.connect(ctx.destination);
-    osc.start(t); osc.stop(t + 0.2);
-    // little noise pop on top
-    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.05, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
-    const ns = ctx.createBufferSource(); ns.buffer = buf;
-    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 1.5;
-    const ng = ctx.createGain(); ng.gain.setValueAtTime(0.3, t);
-    ns.connect(bp); bp.connect(ng); ng.connect(ctx.destination);
-    ns.start(t);
-  },
+// ── Player (look-ahead scheduler) ────────────────────────────────────────────
+const _MP={synth:null,trackId:null,track:null,step:0,next:0,timer:null};
+function _engine(track){const E=Object.create(_MP.synth);E.stepSec=60/track.bpm/4;return E;}
+function _mschedule(){
+  const tr=_MP.track;if(!tr)return;
+  const ac=actx(),E=_engine(tr);
+  while(_MP.next<ac.currentTime+0.12){
+    try{tr.tick(E,_MP.step,_MP.next);}catch(e){console.error(e);}
+    _MP.step++;_MP.next+=E.stepSec;
+  }
+  _MP.timer=setTimeout(_mschedule,25);
+}
+function _playTrack(id){
+  const ac=actx();
+  if(!_MP.synth)_MP.synth=new Synth(ac,musicOut());
+  if(_MP.trackId===id&&_MP.timer)return; // already playing
+  if(_MP.timer){clearTimeout(_MP.timer);_MP.timer=null;}
+  // short fade-in so switching tracks isn't a hard cut
+  const now=ac.currentTime,target=_muted?0:MUSIC_VOL;
+  _musicBus.gain.cancelScheduledValues(now);_musicBus.gain.setValueAtTime(0,now);_musicBus.gain.linearRampToValueAtTime(target,now+0.15);
+  _MP.trackId=id;_MP.track=BAMBOO_TRACKS[id];_MP.step=0;_MP.next=now+0.1;
+  _mschedule();
+}
+function stopMusic(){
+  if(_MP.timer){clearTimeout(_MP.timer);_MP.timer=null;}
+  _MP.track=null;_MP.trackId=null;
+}
+function playGameMusic(){_playTrack('game');}
+function playSuddenDeathMusic(){_playTrack('sd');}
+function playVictoryMusic(){_playTrack('victory');}
+function toggleMuteMusic(){
+  _muted=!_muted;
+  if(_musicBus)_musicBus.gain.setTargetAtTime(_muted?0:MUSIC_VOL,actx().currentTime,0.1);
+  const b=document.getElementById('music-btn');if(b)b.textContent=_muted?'🔇':'🎵';
+}
 
-  // Minus point — short descending blip
-  minus() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(340, t);
-    osc.frequency.exponentialRampToValueAtTime(200, t + 0.12);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.3, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
-    osc.connect(g); g.connect(ctx.destination);
-    osc.start(t); osc.stop(t + 0.15);
-  },
-
-  // Sudden death — low brass stab + tension riser
-  suddenDeath() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    // deep brass stab
-    [55, 58, 65].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      osc.type = 'sawtooth'; osc.frequency.value = freq;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.25, t + 0.03 + i * 0.01);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
-      osc.connect(g); g.connect(ctx.destination);
-      osc.start(t); osc.stop(t + 0.7);
-    });
-    // rising noise swell
-    const buf = ctx.createBuffer(1, ctx.sampleRate * 1.2, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (i / d.length) * 0.6;
-    const src = ctx.createBufferSource(); src.buffer = buf;
-    const lp = ctx.createBiquadFilter(); lp.type = 'bandpass';
-    lp.frequency.setValueAtTime(200, t); lp.frequency.exponentialRampToValueAtTime(2000, t + 1.2);
-    const g = ctx.createGain(); g.gain.setValueAtTime(0.25, t); g.gain.exponentialRampToValueAtTime(0.001, t + 1.2);
-    src.connect(lp); lp.connect(g); g.connect(ctx.destination);
-    src.start(t);
-  },
-
-  // Victory fanfare — ascending 3-note + sparkle
-  victory() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    const notes = [523, 659, 784, 1047]; // C E G C
-    notes.forEach((freq, i) => {
-      const delay = i * 0.13;
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle'; osc.frequency.value = freq;
-      const osc2 = ctx.createOscillator();
-      osc2.type = 'sine'; osc2.frequency.value = freq * 2;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(0, t + delay);
-      g.gain.linearRampToValueAtTime(i === 3 ? 0.4 : 0.28, t + delay + 0.04);
-      g.gain.exponentialRampToValueAtTime(0.001, t + delay + (i === 3 ? 0.9 : 0.35));
-      osc.connect(g); osc2.connect(g); g.connect(ctx.destination);
-      osc.start(t + delay); osc.stop(t + delay + 1);
-      osc2.start(t + delay); osc2.stop(t + delay + 1);
-    });
-    // sparkle hits
-    [0.05, 0.18, 0.34, 0.52, 0.62].forEach(delay => {
-      const buf = ctx.createBuffer(1, ctx.sampleRate * 0.06, ctx.sampleRate);
-      const d = buf.getChannelData(0);
-      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
-      const src = ctx.createBufferSource(); src.buffer = buf;
-      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
-      bp.frequency.value = 3000 + Math.random() * 2000; bp.Q.value = 3;
-      const g = ctx.createGain(); g.gain.setValueAtTime(0.18, t + delay);
-      src.connect(bp); bp.connect(g); g.connect(ctx.destination);
-      src.start(t + delay);
-    });
-  },
-
-  // Splash dismiss — satisfying whomp
-  splashDismiss() {
-    const ctx = actx();
-    const t = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(280, t);
-    osc.frequency.exponentialRampToValueAtTime(120, t + 0.18);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.5, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
-    osc.connect(g); g.connect(ctx.destination);
-    osc.start(t); osc.stop(t + 0.22);
-  },
+// ══════════════════════════════════════════════════════════════════════════════
+// SFX — short, soft, bamboo-flavoured. All through the SFX bus (never direct
+// to the speakers), so they sit on top of the music without blasting.
+// ══════════════════════════════════════════════════════════════════════════════
+let _sfxSynth=null;
+function _sfx(){const ac=actx();if(!_sfxSynth)_sfxSynth=new Synth(ac,sfxOut());return _sfxSynth;}
+const SFX={
+  // card clicked — a quick bamboo "thwap"
+  swat(){const S=_sfx(),t=S.ctx.currentTime;
+    S.noise({t,dur:0.07,vol:0.35,ft:'bandpass',ff:1400,q:1.2});
+    S.voice({f:170,t,dur:0.1,vol:0.35,type:'sine',slideTo:70,slideDur:0.08,a:0.001});
+    S.clack(t+0.005,0.18,900);},
+  // shuffle — soft bamboo rattle
+  shuffle(){const S=_sfx(),t=S.ctx.currentTime;
+    [0,0.05,0.1,0.15].forEach((d,i)=>S.clack(t+d,0.09,1000+i*180));},
+  // point — two-note koto chime, up
+  point(){const S=_sfx(),t=S.ctx.currentTime;
+    S.koto('A5',t,0.25,0.17);S.koto('D6',t+0.07,0.35,0.17);S.bell('D6',t+0.07,0.4,0.07);},
+  // minus — soft two-note down
+  minus(){const S=_sfx(),t=S.ctx.currentTime;
+    S.koto('E5',t,0.2,0.14);S.koto('B4',t+0.08,0.3,0.14);},
+  // sudden death — taiko double-hit + low swell
+  suddenDeath(){const S=_sfx(),t=S.ctx.currentTime;
+    S.taiko(t,0.45,80);S.taiko(t+0.18,0.4,70);
+    S.voice({f:_hz('D2'),t,dur:0.9,vol:0.12,type:'sawtooth',a:0.05,lp:500,lpTo:200});},
+  // victory — little sparkle on top (the victory track carries the fanfare)
+  victory(){const S=_sfx(),t=S.ctx.currentTime;
+    ['D6','F#6','A6','D7'].forEach((n,i)=>S.bell(n,t+i*0.06,0.5,0.05));},
+  // splash dismiss — clack + chime
+  splashDismiss(){const S=_sfx(),t=S.ctx.currentTime;
+    S.clack(t,0.15,1100);S.bell('A5',t+0.04,0.5,0.06);},
 };
 
 
@@ -2356,155 +2439,7 @@ function dismissSplash() {
 
 
 
-// ══════════════════════════════════
-// BGM — two tracks, Web Audio API
-// ══════════════════════════════════
-let _mgain=null, _muted=false, _mnodes=[], _mtimer=null, _mgen=0, _mtrack=null;
 
-function _mac(){
-  const ac=actx(); // share SFX AudioContext
-  if(!_mgain){
-    _mgain=ac.createGain();
-    _mgain.gain.value=_muted?0:0.65;
-    _mgain.connect(ac.destination);
-  }
-  return ac;
-}
-function _mdest(){ return _mgain||(_mac(),_mgain); }
-
-function toggleMuteMusic(){
-  _muted=!_muted;
-  if(_mgain) _mgain.gain.setTargetAtTime(_muted?0:0.65,actx().currentTime,0.1);
-  document.getElementById('music-btn').textContent=_muted?'🔇':'🎵';
-}
-
-function _mn(type,freq,start,dur,vol){
-  const ac=_mac(),o=ac.createOscillator(),g=ac.createGain();
-  o.type=type; o.frequency.value=freq;
-  g.gain.setValueAtTime(0,start);
-  g.gain.linearRampToValueAtTime(vol,start+0.018);
-  g.gain.setValueAtTime(vol,Math.max(start+0.018,start+dur-0.06));
-  g.gain.linearRampToValueAtTime(0,start+dur);
-  o.connect(g); g.connect(_mdest());
-  o.start(start); o.stop(start+dur+0.04);
-  return o;
-}
-function _mnoise(start,dur,vol,lp){
-  const ac=_mac();
-  const buf=ac.createBuffer(1,Math.ceil(ac.sampleRate*dur),ac.sampleRate);
-  const d=buf.getChannelData(0);
-  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,0.4);
-  const src=ac.createBufferSource(); src.buffer=buf;
-  const f=ac.createBiquadFilter(); f.type='lowpass'; f.frequency.value=lp||3000;
-  const g=ac.createGain(); g.gain.setValueAtTime(0,start);
-  g.gain.linearRampToValueAtTime(vol,start+0.01);
-  g.gain.exponentialRampToValueAtTime(0.001,start+dur);
-  src.connect(f); f.connect(g); g.connect(_mdest());
-  src.start(start); return src;
-}
-function stopMusic(){
-  _mgen++;
-  _mnodes.forEach(n=>{try{n.stop(0)}catch(e){}});
-  _mnodes=[]; if(_mtimer){clearTimeout(_mtimer);_mtimer=null;} _mtrack=null;
-}
-
-// ── TRACK 1: Main game — upbeat J-pop pentatonic (148bpm) ────────────────────
-function playGameMusic(){
-  if(_mtrack==='game'&&_mnodes.length) return;
-  stopMusic(); const _gen=++_mgen; _mtrack='game';
-  const ac=_mac(), bpm=148, b=60/bpm, ns=[];
-
-  const C4=261.6,D4=293.7,E4=329.6,G4=392,A4=440,C5=523.3,D5=587.3,E5=659.3,G5=784,A5=880,C6=1046.5;
-  const C3=130.8,G3=196,E3=164.8,A3=220;
-  const C2=65.4,G2=98,A2=110;
-
-  const mel=[
-    [C5,0,0.4],[D5,0.5,0.4],[E5,1,0.9],[G5,2,0.4],[E5,2.5,0.4],[D5,3,0.9],
-    [C5,4,0.4],[E5,4.5,0.4],[G5,5,0.9],[A5,6,0.4],[G5,6.5,0.4],[E5,7,0.9],
-    [D5,8,0.4],[E5,8.5,0.4],[G5,9,0.9],[E5,10,0.4],[D5,10.5,0.4],[C5,11,0.9],
-    [G4,12,0.4],[A4,12.5,0.4],[C5,13,0.9],[D5,14,0.4],[C5,14.5,0.4],[A4,15,0.9],
-    [G4,16,0.4],[C5,16.5,0.4],[E5,17,0.9],[G5,18,0.4],[E5,18.5,0.4],[D5,19,0.9],
-    [C5,20,0.4],[D5,20.5,0.4],[E5,21,0.4],[G5,21.5,0.4],[A5,22,0.4],[G5,22.5,0.4],[E5,23,0.9],
-    [D5,24,0.4],[E5,24.5,0.4],[G5,25,0.9],[A5,26,0.4],[C6,26.5,0.4],[A5,27,0.9],
-    [G5,28,0.4],[E5,28.5,0.4],[D5,29,0.4],[C5,29.5,0.4],[D5,30,0.4],[E5,30.5,0.4],[C5,31,0.9],
-  ];
-  mel.forEach(([f,t,d])=>{
-    ns.push(_mn('square',f,ac.currentTime+t*b,d*b,0.08));
-    ns.push(_mn('triangle',f,ac.currentTime+t*b,d*b,0.04));
-  });
-
-  // harmony thirds
-  const harm=[
-    [A4,0,1.8],[G4,2,1.8],[E4,4,1.8],[D4,6,1.8],[C4,8,1.8],[A3,10,1.8],
-    [G3,12,1.8],[E3,14,1.8],[C4,16,1.8],[A3,18,1.8],[G3,20,1.8],[E3,22,1.8],
-    [D4,24,1.8],[C4,26,1.8],[A3,28,1.8],[G3,30,1.8],
-  ];
-  harm.forEach(([f,t,d])=>ns.push(_mn('triangle',f,ac.currentTime+t*b,d*b,0.035)));
-
-  // bass
-  const bassLine=[C2,C2,G2,G2,A2,A2,G2,C2,C2,G2,A2,G2,C2,A2,G2,C2,
-                  C2,G2,A2,C2,G2,A2,G2,C2,C2,G2,A2,G2,C2,G2,A2,C2];
-  bassLine.forEach((f,t)=>{
-    ns.push(_mn('sawtooth',f,ac.currentTime+t*b,b*0.72,0.13));
-    ns.push(_mn('sine',f,ac.currentTime+t*b,b*0.72,0.07));
-  });
-
-  // drums
-  for(let t=0;t<32;t++){
-    const ot=ac.currentTime+t*b;
-    const o=ac.createOscillator(),g=ac.createGain();
-    o.type='sine'; o.frequency.setValueAtTime(150,ot); o.frequency.exponentialRampToValueAtTime(40,ot+0.09);
-    g.gain.setValueAtTime(0.26,ot); g.gain.exponentialRampToValueAtTime(0.001,ot+0.11);
-    o.connect(g); g.connect(_mdest()); o.start(ot); o.stop(ot+0.13); ns.push(o);
-    if(t%2===1) ns.push(_mnoise(ac.currentTime+t*b,b*0.13,0.10,3800));
-    ns.push(_mnoise(ac.currentTime+t*b,b*0.42,0.02,7500));
-    ns.push(_mnoise(ac.currentTime+t*b+b*0.5,b*0.42,0.014,7500));
-  }
-
-  ns.forEach(n=>_mnodes.push(n));
-  _mtimer=setTimeout(()=>{if(_mgen!==_gen)return;_mtrack=null;playGameMusic();},32*b*1000-120);
-}
-
-// ── TRACK 2: Sudden Death — dark Phrygian tension (155bpm) ───────────────────
-function playSuddenDeathMusic(){
-  if(_mtrack==='sd'&&_mnodes.length) return;
-  stopMusic(); const _gen=++_mgen; _mtrack='sd';
-  const ac=_mac(), bpm=155, b=60/bpm, ns=[];
-
-  const A4=440,Bb4=466.2,C5=523.3,D5=587.3,E5=659.3,F5=698.5,G5=784;
-  const A1=55,E1=41.2;
-
-  const riff=[
-    [A4,0,0.35],[C5,0.5,0.35],[E5,1,0.7],[D5,2,0.35],[C5,2.5,0.35],[Bb4,3,0.7],
-    [A4,4,0.35],[Bb4,4.5,0.35],[C5,5,0.7],[A4,6,0.35],[G5,6.5,0.35],[F5,7,0.7],
-    [A4,8,0.35],[C5,8.5,0.35],[E5,9,0.7],[D5,10,0.35],[E5,10.5,0.35],[A4,11,0.7],
-    [G5,12,0.35],[A4,12.5,0.35],[Bb4,13,0.35],[C5,13.5,0.35],[D5,14,0.35],[E5,14.5,0.35],[A4,15,0.7],
-  ];
-  riff.forEach(([f,t,d])=>{
-    ns.push(_mn('sawtooth',f,ac.currentTime+t*b,d*b,0.18));
-    ns.push(_mn('square',f*0.5,ac.currentTime+t*b,d*b,0.10));
-  });
-
-  // frantic drums
-  for(let t=0;t<16;t++){
-    const ot=ac.currentTime+t*b;
-    const o=ac.createOscillator(),g=ac.createGain();
-    o.type='sine'; o.frequency.setValueAtTime(160,ot); o.frequency.exponentialRampToValueAtTime(38,ot+0.07);
-    g.gain.setValueAtTime(0.45,ot); g.gain.exponentialRampToValueAtTime(0.001,ot+0.09);
-    o.connect(g); g.connect(_mdest()); o.start(ot); o.stop(ot+0.11); ns.push(o);
-    // half-beat kick
-    const ot2=ac.currentTime+(t+0.5)*b;
-    const o2=ac.createOscillator(),g2=ac.createGain();
-    o2.type='sine'; o2.frequency.setValueAtTime(140,ot2); o2.frequency.exponentialRampToValueAtTime(38,ot2+0.06);
-    g2.gain.setValueAtTime(0.28,ot2); g2.gain.exponentialRampToValueAtTime(0.001,ot2+0.08);
-    o2.connect(g2); g2.connect(_mdest()); o2.start(ot2); o2.stop(ot2+0.1); ns.push(o2);
-    if(t%4===2||t%4===3) ns.push(_mnoise(ac.currentTime+t*b,b*0.12,0.28,2500));
-    for(let s=0;s<2;s++) ns.push(_mnoise(ac.currentTime+(t+s*0.5)*b,b*0.38,0.05,8000));
-  }
-
-  ns.forEach(n=>_mnodes.push(n));
-  _mtimer=setTimeout(()=>{if(_mgen!==_gen)return;_mtrack=null;playSuddenDeathMusic();},16*b*1000-120);
-}
 
 </script>
 

@@ -57,7 +57,7 @@ body {
   flex-wrap: nowrap;
 }
 .header-row.row-top { justify-content: space-between; }
-.header-row.row-bot { justify-content: center; position: relative; }
+.header-row.row-bot { justify-content: center; position: relative; flex-wrap: wrap; row-gap: 6px; }
 
 .logo {
   font-family: 'Bebas Neue', cursive;
@@ -325,6 +325,10 @@ input[type="number"] { width: 72px; }
 }
 .score-inner { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
 .score-name {
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: 'Bebas Neue', cursive;
   font-size: 1rem;
   letter-spacing: 0.12em;
@@ -368,8 +372,12 @@ input[type="number"] { width: 72px; }
 .team-inputs {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  flex-shrink: 0;
 }
+/* long names that don't fit on the controls line get a line of their own */
+.team-inputs.own-line { order: 99; flex-basis: 100%; justify-content: center; }
+.swatch-divider.hide { display: none; }
 input.team-name {
   background: rgba(255,255,255,0.05);
   border: 1px solid rgba(82,183,136,0.25);
@@ -380,6 +388,7 @@ input.team-name {
   letter-spacing: 0.08em;
   padding: 5px 10px;
   width: 90px;
+  flex-shrink: 0;
   outline: none;
   transition: border-color 0.2s;
 }
@@ -417,6 +426,11 @@ input.team-name:focus { border-color: var(--green-light); color: #fff; }
   gap: 8px;
 }
 .team-btn-name {
+  display: block;
+  max-width: 38vw;
+  text-align: center;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
   font-family: 'Bebas Neue', cursive;
   font-size: 1rem;
   letter-spacing: 0.12em;
@@ -492,6 +506,8 @@ input.team-name:focus { border-color: var(--green-light); color: #fff; }
   animation: vfadein 0.8s ease both;
 }
 .victory-name {
+  max-width: 92vw;
+  overflow-wrap: anywhere;
   font-family: 'Bebas Neue', cursive;
   font-size: clamp(5rem, 16vw, 12rem);
   line-height: 0.9;
@@ -727,11 +743,13 @@ input.team-name:focus { border-color: var(--green-light); color: #fff; }
     <div class="swatch"        id="sw5" style="background:linear-gradient(135deg,#ff7800 50%,#00aaff 50%)" title="amber"  onclick="setTheme(5)"></div>
     <div class="swatch"        id="sw6" style="background:linear-gradient(135deg,#111111 50%,#f5f5f5 50%)" title="paper"  onclick="setTheme(6)"></div>
     <div class="swatch-divider"></div>
-    <span class="control-label">Teams</span>
-    <input class="team-name" id="team-a-name" value="TEAM A" maxlength="10" oninput="updateNames()">
-    <span class="team-sep">vs</span>
-    <input class="team-name" id="team-b-name" value="TEAM B" maxlength="10" oninput="updateNames()">
-    <div class="swatch-divider"></div>
+    <div class="team-inputs" id="team-inputs">
+      <span class="control-label">Teams</span>
+      <input class="team-name" id="team-a-name" value="TEAM A" maxlength="30" oninput="updateNames()">
+      <span class="team-sep">vs</span>
+      <input class="team-name" id="team-b-name" value="TEAM B" maxlength="30" oninput="updateNames()">
+    </div>
+    <div class="swatch-divider" id="team-inputs-div"></div>
     <span class="control-label">First to</span>
     <input type="number" id="play-to" value="10" min="1" max="99" style="width:52px" oninput="updateBar()">
     <button class="btn-reset-score" onclick="resetScores()">reset scores</button>
@@ -1735,6 +1753,70 @@ function setTheme(i) {
 
 let scores = [0, 0];
 
+// ── Fit team names to the space they have ────────────────────────────────────
+// Measures with a hidden span that copies the element's font, then picks the
+// biggest font size (between min and max px) that fits on one line. If even the
+// minimum doesn't fit, the text is allowed to wrap.
+let _measureEl=null;
+function textWidth(el,text,px){
+  if(!_measureEl){_measureEl=document.createElement('span');_measureEl.style.cssText='position:absolute;left:-9999px;top:-9999px;visibility:hidden;white-space:nowrap;';document.body.appendChild(_measureEl);}
+  const cs=getComputedStyle(el);
+  _measureEl.style.fontFamily=cs.fontFamily;_measureEl.style.fontWeight=cs.fontWeight;
+  _measureEl.style.letterSpacing=(parseFloat(cs.letterSpacing)||0)/(parseFloat(cs.fontSize)||16)*px+'px';
+  _measureEl.style.fontSize=px+'px';_measureEl.textContent=text;
+  return _measureEl.getBoundingClientRect().width;
+}
+function fitText(el,maxW,maxPx,minPx){
+  if(!el)return;
+  const text=el.textContent||el.value||'';
+  el.style.fontSize='';el.style.whiteSpace='nowrap';
+  let px=maxPx;
+  while(px>minPx&&textWidth(el,text,px)>maxW)px-=1;
+  el.style.fontSize=px+'px';
+  if(textWidth(el,text,px)>maxW)el.style.whiteSpace='normal';
+  return px;
+}
+function fitNameInputs(){
+  const ins=['team-a-name','team-b-name'].map(id=>document.getElementById(id));
+  const group=document.getElementById('team-inputs'), row=group.parentElement;
+  const cap=Math.min(280,row.clientWidth/2-70);
+  // width each box needs at a comfortable font size
+  const need=(inp,px)=>textWidth(inp,inp.value||'',px)+24;
+  ins.forEach(i=>{i.style.width='90px';i.style.fontSize='';i.style.whiteSpace='';});
+  // free space if the whole header row stays on one line (boxes at 90px)
+  const gap=parseFloat(getComputedStyle(row).columnGap)||10;
+  const kids=[...row.children].filter(k=>k.offsetParent!==null);
+  const used=kids.reduce((s,k)=>s+k.getBoundingClientRect().width,0)+gap*(kids.length-1);
+  const slack=Math.max(0,row.clientWidth-used-4);
+  // one line if the names still fit at >=12px; otherwise let the team group wrap
+  // onto its own line and give each box up to `cap`
+  const oneLineMax=90+slack/2;
+  const fitsOneLine=ins.every(i=>need(i,11)<=oneLineMax);
+  const maxW=fitsOneLine?oneLineMax:Math.max(90,cap);
+  group.classList.toggle('own-line',!fitsOneLine);
+  document.getElementById('team-inputs-div').classList.toggle('hide',!fitsOneLine);
+  const rem=parseFloat(getComputedStyle(document.documentElement).fontSize)||16;
+  ins.forEach(inp=>{
+    const px=fitText(inp,Math.min(maxW,280)-24,rem,10); inp.style.whiteSpace='';
+    inp.style.width=Math.max(90,Math.min(maxW,280,need(inp,px)))+'px';
+  });
+}
+function fitScoreNames(){
+  const rem=parseFloat(getComputedStyle(document.documentElement).fontSize)||16;
+  fitBarNames();
+  ['detail-name-a','detail-name-b'].forEach(id=>{
+    const el=document.getElementById(id);
+    fitText(el,window.innerWidth*0.38,Math.max(rem,Math.min(28,window.innerHeight*0.035)),12);
+  });
+  fitNameInputs();
+}
+function fitVictoryName(){
+  const el=document.getElementById('victory-name');
+  const maxPx=Math.min(192,Math.max(80,window.innerWidth*0.16));
+  fitText(el,window.innerWidth*0.9,maxPx,40);
+}
+window.addEventListener('resize',()=>{fitScoreNames();if(document.getElementById('victory-screen').classList.contains('active'))fitVictoryName();});
+
 function updateNames() {
   const a = document.getElementById('team-a-name').value || 'TEAM A';
   const b = document.getElementById('team-b-name').value || 'TEAM B';
@@ -1742,6 +1824,7 @@ function updateNames() {
   document.getElementById('score-name-b').textContent  = b;
   document.getElementById('detail-name-a').textContent = a;
   document.getElementById('detail-name-b').textContent = b;
+  fitScoreNames();
 }
 
 function updateBar() {
@@ -1752,6 +1835,22 @@ function updateBar() {
   const wB = Math.min(scores[1] / target, 1) * halfW;
   document.getElementById('bar-a').style.width = wA + 'px';
   document.getElementById('bar-b').style.width = wB + 'px';
+  _barW=[wA,wB];
+  if(typeof fitBarNames==='function') fitBarNames();
+}
+let _barW=[0,0];
+// fit each team name into the room its bar will have (target width, not the
+// mid-animation width): shrink down to 10px, then ellipsis
+function fitBarNames(){
+  const rem=parseFloat(getComputedStyle(document.documentElement).fontSize)||16;
+  ['a','b'].forEach((k,i)=>{
+    const name=document.getElementById('score-name-'+k), num=document.getElementById('score-'+k);
+    const avail=_barW[i]-16-10-(num.getBoundingClientRect().width||30)-6;
+    name.style.maxWidth='';
+    fitText(name,Math.max(1,avail),rem,10);
+    name.style.whiteSpace='nowrap';
+    name.style.maxWidth=Math.max(0,avail)+'px';
+  });
 }
 
 function addPoint(team, delta, e) {
@@ -2031,6 +2130,7 @@ function showVictory(team) {
   bg.style.background = `radial-gradient(ellipse 80% 70% at 50% 40%, ${teamColor}55 0%, ${teamColor}22 40%, #000000cc 100%)`;
 
   document.getElementById('victory-name').textContent = names[team].toUpperCase();
+  fitVictoryName();
   document.getElementById('victory-name').style.color = teamColor;
   document.getElementById('victory-label').style.color = '#fff';
   document.getElementById('victory-sub').style.color = '#fff';
@@ -2072,6 +2172,7 @@ function dismissSuddenDeath(winningTeam) {
   const bg = document.getElementById('victory-bg');
   bg.style.background = `radial-gradient(ellipse 80% 70% at 50% 40%, ${color}55 0%, ${color}22 40%, #000000cc 100%)`;
   document.getElementById('victory-name').textContent = names[winningTeam].toUpperCase();
+  fitVictoryName();
   document.getElementById('victory-name').style.color = color;
   document.getElementById('victory-label').style.color = '#fff';
   document.getElementById('victory-sub').style.color = '#fff';
@@ -2424,6 +2525,8 @@ const SFX={
 
 applyTeamColors();
 updateBar();
+fitScoreNames();
+if(document.fonts&&document.fonts.ready)document.fonts.ready.then(fitScoreNames);
 shuffle();
 
 
